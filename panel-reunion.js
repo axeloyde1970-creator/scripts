@@ -114,6 +114,86 @@
     const lazyAttr = el => [...el.attributes].filter(a => /^data-/i.test(a.name) && IMG_RE.test(a.value)).sort((a, b) => rank(a.name) - rank(b.name)).map(a => a.value)[0];
     const lastSrcset = s => { const p = (s || '').split(',').map(x => x.trim().split(/\s+/)[0]).filter(Boolean); return p[p.length - 1]; };
     const keyOf = s => s.split('?')[0].replace(/_(xs|sm|md|lg|xl)(\.\w+)$/i, '$2');
+    // Nombre legible del archivo de la imagen (fallback cuando no hay alt/title)
+    const nameFromSrc = src => {
+      try {
+        let name = decodeURIComponent((src || '').split(/[?#]/)[0].split('/').pop() || '');
+        name = name.replace(/\.(jpe?g|png|webp|gif)$/i, '')
+                   .replace(/_(xs|sm|md|lg|xl)$/i, '')
+                   .replace(/[-_+]+/g, ' ')
+                   .replace(/\s+/g, ' ')
+                   .trim();
+        if (!name || /^(img|image|photo|picture|media|asset|icon|logo|sprite|blank|placeholder|\d+)$/i.test(name)) return '';
+        return name;
+      } catch { return ''; }
+    };
+    // Recoger texto descriptivo de atributos de un elemento
+    const attrsDesc = el => {
+      if (!el || !el.getAttribute) return [];
+      const out = [];
+      const keys = ['alt', 'title', 'aria-label', 'aria-description', 'data-alt', 'data-title',
+        'data-caption', 'data-description', 'data-img-caption', 'data-img-alt', 'data-label',
+        'data-name', 'data-desc', 'longdesc'];
+      for (const k of keys) {
+        const v = clean(el.getAttribute(k) || (k === 'alt' ? el.alt : '') || (k === 'title' ? el.title : ''));
+        if (v) out.push(v);
+      }
+      // Cualquier data-* que parezca descripción (texto largo, no URL)
+      try {
+        for (const a of el.attributes) {
+          if (/^data-/i.test(a.name) && a.value && a.value.length > 15 && a.value.length < 400
+              && !/^https?:\/\//i.test(a.value) && !IMG_RE.test(a.value) && !/^\d+$/.test(a.value)) {
+            const v = clean(a.value);
+            if (v && !LINE_JUNK.test(v)) out.push(v);
+          }
+        }
+      } catch {}
+      // aria-labelledby / aria-describedby
+      for (const ref of ['aria-labelledby', 'aria-describedby']) {
+        const ids = (el.getAttribute(ref) || '').split(/\s+/).filter(Boolean);
+        for (const id of ids) {
+          const refEl = (el.ownerDocument || document).getElementById(id);
+          if (refEl) {
+            const t = clean(refEl.textContent);
+            if (t && t.length < 400) out.push(t);
+          }
+        }
+      }
+      return out;
+    };
+    // Mejor descripción posible de la imagen
+    const imgDesc = (el, src, extra) => {
+      const candidates = [];
+      if (extra) { const t = clean(extra); if (t) candidates.push(t); }
+      if (el) {
+        candidates.push(...attrsDesc(el));
+        // Subir 1-3 niveles: a veces el alt/aria está en el contenedor (picture, figure, div)
+        let p = el.parentElement;
+        for (let i = 0; i < 3 && p; i++, p = p.parentElement) {
+          candidates.push(...attrsDesc(p));
+          // figcaption dentro del contenedor
+          const cap = p.querySelector && p.querySelector('figcaption, .caption, [class*="caption"], [class*="credit"]');
+          if (cap) {
+            const t = clean(cap.textContent);
+            if (t && t.length > 2 && t.length < 400) candidates.push(t);
+          }
+        }
+        // Hermano siguiente o anterior con texto de leyenda
+        for (const sib of [el.nextElementSibling, el.previousElementSibling]) {
+          if (sib && /^(FIGCAPTION|P|SPAN|DIV|SMALL|FIG|LABEL)$/i.test(sib.tagName)
+              && (sib.textContent || '').length > 5 && (sib.textContent || '').length < 250) {
+            const t = clean(sib.textContent);
+            if (t && !LINE_JUNK.test(t)) candidates.push(t);
+          }
+        }
+      }
+      // Filtrar basura y elegir la más descriptiva (más larga, pero no absurda)
+      const uniq = [...new Set(candidates.filter(t => t && t.length > 2 && !LINE_JUNK.test(t)
+        && !/^(reproducir|descargar|compartir|ver más|leer más)$/i.test(t)))];
+      let best = uniq.sort((a, b) => b.length - a.length)[0] || '';
+      if (!best) best = nameFromSrc(src);
+      return best || 'sin descripción';
+    };
 
     function parse(nodes, base, o = {}) {
       const items = [], allC = [], seen = new Set();
@@ -132,7 +212,7 @@
       };
       const handleImg = im => {
         const src = lazyAttr(im) || lastSrcset(im.srcset) || im.currentSrc || im.src || '', w = im.naturalWidth || im.width || 0;
-        if (src && !BAD_IMG.test(src) && (w === 0 || w >= 60)) addImage(src, clean(im.alt) || clean(im.title));
+        if (src && !BAD_IMG.test(src) && (w === 0 || w >= 60)) addImage(src, imgDesc(im, src));
       };
       const walk = el => { for (const c of el.childNodes) { if (done) return; visit(c); } };
       function visit(c) {
@@ -148,15 +228,23 @@
         if (/^H[1-6]$/.test(tag) && STOP.test(clean(c.textContent)) && (o.nested || !startEl)) { flush(); done = true; return; }
         if (tag === 'BR') { o.inline ? buf += ' ' : flush(); return; }
         if (tag === 'IMG') { handleImg(c); return; }
-        if (tag === 'VIDEO' && c.poster) { addImage(c.poster, 'póster de video'); return; }
+        if (tag === 'VIDEO' && c.poster) { addImage(c.poster, imgDesc(c, c.poster, 'póster de video')); return; }
         const ds = lazyAttr(c);
-        if (ds && !BAD_IMG.test(ds)) addImage(ds, clean(c.getAttribute('aria-label') || c.getAttribute('title') || c.getAttribute('alt')));
+        if (ds && !BAD_IMG.test(ds)) addImage(ds, imgDesc(c, ds));
         const bg = cs.backgroundImage;
-        if (bg && bg.startsWith('url(') && c.offsetWidth >= 60 && c.offsetHeight >= 60) addImage(bg.slice(4, -1).replace(/["']/g, ''), clean(c.getAttribute('aria-label')));
+        if (bg && bg.startsWith('url(') && c.offsetWidth >= 60 && c.offsetHeight >= 60) {
+          const bgSrc = bg.slice(4, -1).replace(/["']/g, '');
+          addImage(bgSrc, imgDesc(c, bgSrc));
+        }
         if (o.inline && /^v\d/.test(c.id || '')) buf += ' ';
         const href = tag === 'A' ? c.getAttribute('href') : null;
         if (href && !/^(javascript|mailto|tel):/i.test(href)) {
-          if (IMG_RE.test(href)) { addImage(href, clean(c.title || c.getAttribute('aria-label') || c.textContent)); return; }
+          if (IMG_RE.test(href)) {
+            // Preferir alt del <img> interno si existe
+            const nestedImg = c.querySelector('img');
+            addImage(href, imgDesc(nestedImg || c, href, c.textContent));
+            return;
+          }
           const txt = clean(c.textContent), abs = href.startsWith('#') ? base.split('#')[0] + href : A(href);
           if (o.nested && /^\d+$/.test(txt) && c.closest('[id^="v"]')) return;
           if (!txt) return;
@@ -237,8 +325,9 @@
 
     // ---------- HTML con imágenes ----------
     const stats = { cites: 0, ok: 0, imgs: 0, list: [] };
-    (function count(items) { for (const it of items) { if (it.img) { stats.imgs++; stats.list.push(it.img); } for (const c of it.cites) { stats.cites++; if (c.res) { stats.ok++; count(c.res); } } } })(main.items);
-    say(`Incrustando ${stats.imgs} imágenes…`);
+    (function count(items) { for (const it of items) { if (it.img) { stats.imgs++; stats.list.push(it.img); if (it.img.desc && it.img.desc !== 'sin descripción') stats.withDesc = (stats.withDesc || 0) + 1; } for (const c of it.cites) { stats.cites++; if (c.res) { stats.ok++; count(c.res); } } } })(main.items);
+    say(`Incrustando ${stats.imgs} imágenes (${stats.withDesc || 0} con descripción)…`);
+    if (stats.list.length) console.log('Descripciones de imágenes:', stats.list.map((im, i) => `[${i + 1}] ${im.desc}`));
     let i = 0, embedded = 0;
     await Promise.all(Array.from({ length: 4 }, async () => { while (i < stats.list.length) { const im = stats.list[i++]; try {
       const b = await (await fetch(im.src)).blob();
@@ -256,7 +345,7 @@
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([`<!doctype html><html lang="es"><head><meta charset="utf-8"><title>${esc(base)}</title><style>${css}</style></head><body>${renderHtml(main.items, { n: 0 })}</body></html>`], { type: 'text/html;charset=utf-8' }));
     a.download = base + '.html'; document.body.appendChild(a); a.click(); a.remove();
-    say(`Listo: ${stats.cites} citas (${stats.ok} con texto), ${stats.imgs} imágenes (${embedded} incrustadas)\nOmitidas por filtro: ${omitted.length} (ver consola)` + (diag.length ? `\nSin texto: ${diag.length} (ver consola)` : ''));
+    say(`Listo: ${stats.cites} citas (${stats.ok} con texto), ${stats.imgs} imágenes (${stats.withDesc || 0} con descripción, ${embedded} incrustadas)\nOmitidas por filtro: ${omitted.length} (ver consola)` + (diag.length ? `\nSin texto: ${diag.length} (ver consola)` : ''));
     if (omitted.length) console.log('Citas omitidas:\n' + omitted.join('\n'));
     if (diag.length) console.log('Citas sin texto:', diag.slice(0, 20));
   }
